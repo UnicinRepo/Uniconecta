@@ -1,5 +1,6 @@
 import boto3
 import os
+import re
 import json
 import logging
 import urllib.request
@@ -7,17 +8,20 @@ import time
 import random
 import string
 from datetime import datetime
+from boto3.dynamodb.conditions import Key
 
 # --- Logger Configuration ---
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # --- Environment Variable Configurations ---
-DYNAMODB_USERS_TABLE_NAME = os.environ.get('AWS_DYNAMODB_TABLE_TARGET_NAME_0')
-DYNAMODB_REQUESTS_TABLE_NAME = os.environ.get('AWS_DYNAMODB_TABLE_TARGET_NAME_1')
+# Aceita as duas convenções de nome (com e sem TARGET) para casar com a infra.
+DYNAMODB_USERS_TABLE_NAME = os.environ.get('AWS_DYNAMODB_TABLE_NAME_0') or os.environ.get('AWS_DYNAMODB_TABLE_TARGET_NAME_0')
+DYNAMODB_REQUESTS_TABLE_NAME = os.environ.get('AWS_DYNAMODB_TABLE_NAME_1') or os.environ.get('AWS_DYNAMODB_TABLE_TARGET_NAME_1')
 AWS_REGION = os.environ.get('REGION', 'us-east-1')
 API_URL = os.environ.get('API_URL', 'https://gate.whapi.cloud')
-PARAM_NAME_TOKEN = os.getenv("AWS_SSM_PARAMETER_TARGET_NAME_0")
+PARAM_NAME_TOKEN = os.environ.get('AWS_SSM_PARAMETER_NAME_0') or os.getenv("AWS_SSM_PARAMETER_TARGET_NAME_0")
+STATUS_INDEX = os.environ.get('STATUS_INDEX_NAME', 'StatusIndex')
 
 # --- Initial Validations ---
 if not DYNAMODB_USERS_TABLE_NAME or not DYNAMODB_REQUESTS_TABLE_NAME or not PARAM_NAME_TOKEN:
@@ -56,6 +60,7 @@ MESSAGES = {
     'emergency_confirmation': "Sua solicitação foi enviada aos voluntários mais próximos. \nSe ninguém entrar em contato rapidamente, por favor acione alguém de confiança que esteja por perto ou ligue para o 192 imediatamente. \nSua segurança é prioridade.",
     'erro_envio_notificacao': "Sua solicitação foi recebida, mas não foi possível notificar um ou mais contatos.",
     'erro_usuario_nao_encontrado': "Você não está registrado no nosso sistema. Não é possível continuar.",
+    'cadastro_em_analise': "Seu cadastro foi recebido e está em análise pela Comissão de Voluntariado. Assim que for aprovado, você poderá usar este canal. Obrigado pela paciência!",
     'erro_sem_contato_emergencia': "Ação não realizada. Você não possui uma lista de contatos cadastrada.",
     'pergunta_batepapo': (
         "Opa. Que bom que você nos procurou.\n"
@@ -155,8 +160,8 @@ def send_main_menu_with_buttons(to):
 def send_alert_with_buttons(to, body_text, request_id):
     action = {
         "buttons": [
-            {"type": "quick_reply", "id": f"accept_{request_id}", "title": "✅ Aceitar"}, 
-            {"type": "quick_reply", "id": f"decline_{request_id}", "title": "❌ Recusar"}
+            {"type": "quick_reply", "id": f"accept_{request_id}", "title": "✅ Aceitar"},
+            {"type": "quick_reply", "id": f"decline_{request_id}", "title": "❌ Indisponível"}
         ]
     }
     return send_interactive_message(to, "button", body_text, action)
@@ -194,24 +199,93 @@ def send_ride_type_buttons(to):
     return send_interactive_message(to, "button", MESSAGES['ride_intro'], action)
 
 
-def get_user_info(user_id):
-    try:
-        response = users_table.get_item(Key={'ID': user_id})
-        return response.get('Item')
-    except Exception as e: 
-        logger.error(f"Error fetching user '{user_id}': {e}")
-        return None
+def phone_variants(num):
+    """Gera variantes BR com/sem o 9 após o DDD (o WhatsApp costuma entregar
+    o JID sem o 9). Ex.: '553186155781' <-> '5531986155781'."""
+    digits = re.sub(r'\D', '', str(num or ''))
+    variants = [digits]
+    if digits.startswith('55') and len(digits) >= 12:
+        ddd, rest = digits[2:4], digits[4:]
+        if len(rest) == 8:                       # sem 9 -> adiciona
+            variants.append(f"55{ddd}9{rest}")
+        elif len(rest) == 9 and rest[0] == '9':  # com 9 -> remove
+            variants.append(f"55{ddd}{rest[1:]}")
+    return variants
 
-def update_user_data(user_id, state):
+
+def find_user(raw_clean):
+    """Procura o usuário tolerando o 9º dígito. Devolve (item, stored_id)."""
+    for cand in phone_variants(raw_clean):
+        try:
+            item = users_table.get_item(Key={'ID': cand}).get('Item')
+        except Exception as e:
+            logger.error(f"Error fetching user '{cand}': {e}")
+            item = None
+        if item:
+            return item, cand
+    return None, raw_clean
+
+
+def get_user_info(user_id):
+    item, _ = find_user(user_id)
+    return item
+
+
+def display_name(user_info):
+    """Nome usado nas solicitações e atendimentos: o nome preferido, se informado;
+    senão o nome completo (fallback final para um rótulo genérico)."""
+    if not user_info:
+        return 'Voluntário(a)'
+    return (user_info.get('nome_preferido')
+            or user_info.get('nome_completo')
+            or 'Voluntário(a)')
+
+
+def get_approved_numbers(exclude_id=None):
+    """Rede aprovada via Query no GSI (sem Scan). Retorna [(id, target)] onde
+    target é o wa_jid real (se conhecido) ou o próprio id — para entrega correta."""
+    pairs, kwargs = [], {'IndexName': STATUS_INDEX,
+                         'KeyConditionExpression': Key('status').eq('approved')}
     try:
-        users_table.update_item(
-            Key={'ID': user_id}, 
-            UpdateExpression='SET conversation_state = :state', 
-            ExpressionAttributeValues={':state': state}
-        )
+        while True:
+            response = users_table.query(**kwargs)
+            for it in response.get('Items', []):
+                uid = it.get('ID')
+                if uid and uid != exclude_id:
+                    pairs.append((uid, it.get('wa_jid') or uid))
+            if 'LastEvaluatedKey' not in response:
+                break
+            kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
+    except Exception as e:
+        logger.error(f"Error querying approved users: {e}")
+    return pairs
+
+def update_user_data(user_id, state, wa_jid=None):
+    try:
+        expr = 'SET conversation_state = :state, state_last_updated = :ts'
+        values = {':state': state, ':ts': datetime.utcnow().isoformat()}
+        if wa_jid:
+            expr += ', wa_jid = :wa'
+            values[':wa'] = wa_jid
+        users_table.update_item(Key={'ID': user_id}, UpdateExpression=expr,
+                                ExpressionAttributeValues=values)
         logger.info(f"User data for '{user_id}' updated. New state: '{state}'.")
-    except Exception as e: 
+    except Exception as e:
         logger.error(f"Error updating data for user '{user_id}': {e}")
+
+
+def send_target(user_id):
+    """JID real de envio: o wa_jid (número exato de onde a pessoa fala) se
+    conhecido; senão o próprio ID. Resolve a inconsistência do 9º dígito no envio."""
+    if not user_id:
+        return user_id
+    try:
+        item = users_table.get_item(Key={'ID': user_id}).get('Item')
+        if item and item.get('wa_jid'):
+            return item['wa_jid']
+    except Exception as e:
+        logger.error(f"Error resolving send target for '{user_id}': {e}")
+    return user_id
 
 
 # --- Request and Acceptance Flow Functions ---
@@ -220,21 +294,25 @@ def generate_request_id():
     return f"{''.join(random.choices(string.ascii_uppercase, k=3))}-{''.join(random.choices(string.digits, k=3))}"
 
 def create_and_notify_request(sender_id, user_info, request_type, message_template, user_input="", confirmation_message_key='ride_confirm_generic'):
-    user_id_clean = sender_id.replace('@s.whatsapp.net', '').replace('@c.us', '')
-    user_name = user_info.get('nome', 'Nome não encontrado')
-    contact_list = user_info.get('lista_contatos')
-    if not contact_list:
+    # Usa o ID canônico armazenado (resolve o 9º dígito), não o JID recebido.
+    user_id_clean = user_info.get('ID') or sender_id.replace('@s.whatsapp.net', '').replace('@c.us', '')
+    requester_wa = re.sub(r'\D', '', sender_id.split('@')[0]) or user_id_clean  # JID real de quem pediu
+    user_name = display_name(user_info)  # nome preferido (fallback: nome completo)
+    # Notifica TODA a rede aprovada (menos o solicitante), não só a lista de contatos.
+    network = get_approved_numbers(exclude_id=user_id_clean)  # [(id, target)]
+    if not network:
         send_whapi_message(sender_id, MESSAGES['erro_sem_contato_emergencia'])
         update_user_data(user_id_clean, 'initial')
         return
 
+    contact_list = [uid for uid, _ in network]  # IDs canônicos (matching do aceite)
     request_id = generate_request_id()
     try:
         requests_table.put_item(Item={
             'ID': request_id, 'requester_id': user_id_clean, 'requester_name': user_name,
-            'contact_list': contact_list, 'status': 'pendente',
+            'requester_wa': requester_wa, 'contact_list': contact_list, 'status': 'pendente',
             'creation_timestamp': datetime.utcnow().isoformat(), 'request_type': request_type,
-            'request_details': user_input, 'ttl': int(time.time()) + 86400 
+            'request_details': user_input, 'ttl': int(time.time()) + 86400
         })
     except Exception as e:
         logger.error(f"Error creating request in DynamoDB: {e}")
@@ -243,7 +321,9 @@ def create_and_notify_request(sender_id, user_info, request_type, message_templa
         return
 
     final_message_text = message_template.format(user_name=user_name, user_number=user_id_clean, user_input=user_input, request_id=request_id)
-    success_count = sum(1 for c in contact_list if send_alert_with_buttons(f"{str(c).strip()}@s.whatsapp.net", final_message_text, request_id))
+    # Envia o alerta para o JID real de cada membro da rede.
+    success_count = sum(1 for _, target in network
+                        if send_alert_with_buttons(f"{str(target).strip()}@s.whatsapp.net", final_message_text, request_id))
     send_whapi_message(sender_id, MESSAGES[confirmation_message_key] if success_count > 0 else MESSAGES['erro_envio_notificacao'])
     update_user_data(user_id_clean, 'initial')
 
@@ -260,17 +340,18 @@ def handle_acceptance(accepter_id, request_id):
         send_whapi_message(accepter_id, MESSAGES['erro_solicitacao_nao_encontrada' if not request_item else 'erro_solicitacao_ja_aceita'])
         return
 
-    accepter_info = get_user_info(accepter_id_clean)
-    accepter_name = accepter_info.get('nome', 'Um contato') if accepter_info else 'Um contato'
+    accepter_info, accepter_id_clean = find_user(accepter_id_clean)  # resolve 9º dígito
+    accepter_name = display_name(accepter_info) if accepter_info else 'Um contato'
 
     try:
         requests_table.update_item(
             Key={'ID': request_id},
-            UpdateExpression='SET #st = :status, accepter_id = :accepter, acceptance_timestamp = :ts, accepter_name = :aname',
+            UpdateExpression='SET #st = :status, accepter_id = :accepter, acceptance_timestamp = :ts, accepter_name = :aname, feedback_pending = :fp',
             ExpressionAttributeNames={'#st': 'status'},
             ExpressionAttributeValues={
                 ':status': 'aceito', ':accepter': accepter_id_clean,
-                ':ts': datetime.utcnow().isoformat(), ':aname': accepter_name 
+                ':ts': datetime.utcnow().isoformat(), ':aname': accepter_name,
+                ':fp': True  # feedback enviado depois pelo monitor (~10-15 min), não junto do aceite
             }
         )
     except Exception as e: 
@@ -278,23 +359,26 @@ def handle_acceptance(accepter_id, request_id):
         return
 
     requester_id = request_item['requester_id']
-    requester_id_wa = f"{requester_id}@s.whatsapp.net"
+    # Envia para o JID REAL do solicitante (resolve o 9º dígito no envio).
+    requester_target = request_item.get('requester_wa') or requester_id
+    requester_id_wa = f"{requester_target}@s.whatsapp.net"
     accepter_link = f"https://wa.me/{accepter_id_clean}"
     requester_link = f"https://wa.me/{requester_id}"
 
     # Envia confirmação para o solicitante
     send_whapi_message(requester_id_wa, MESSAGES['solicitacao_aceita_para_solicitante'].format(accepter_name=accepter_name, accepter_link=accepter_link))
-    
-    # Envia a nova mensagem de feedback (antigo NPS)
-    send_whapi_message(requester_id_wa, MESSAGES['feedback_prompt'])
 
-    # Envia confirmação para quem aceitou
+    # A mensagem de feedback NÃO é enviada aqui: o monitor (chatbot_check.py) a envia
+    # ~10-15 min depois, para não competir com o atendimento (feedback_pending=True acima).
+
+    # Envia confirmação para quem aceitou (JID real do clique)
     send_whapi_message(accepter_id, MESSAGES['confirmacao_aceite_para_aceitante'].format(requester_name=request_item['requester_name'], requester_link=requester_link))
-    
-    # Notifica os outros contatos
+
+    # Notifica os outros contatos (no JID real de cada um)
     for contact_num in request_item.get('contact_list', []):
-        if str(contact_num).strip() not in [accepter_id_clean, requester_id]:
-            send_whapi_message(f"{str(contact_num).strip()}@s.whatsapp.net", MESSAGES['notificacao_outros_contatos'].format(requester_name=request_item['requester_name']))
+        cid = str(contact_num).strip()
+        if cid not in [accepter_id_clean, requester_id]:
+            send_whapi_message(f"{send_target(cid)}@s.whatsapp.net", MESSAGES['notificacao_outros_contatos'].format(requester_name=request_item['requester_name']))
 
 # --- Main Lambda Handler ---
 
@@ -308,7 +392,8 @@ def lambda_handler(event, context):
 
             sender_id = message.get('chat_id') or message.get('from')
             user_id_clean = sender_id.replace('@s.whatsapp.net', '').replace('@c.us', '')
-            
+            incoming_jid = re.sub(r'\D', '', str(user_id_clean))  # JID real de onde veio a msg
+
             text_input = message.get('text', {}).get('body', '').strip()
             
             button_reply_id = message.get('reply', {}).get('buttons_reply', {}).get('id')
@@ -318,12 +403,27 @@ def lambda_handler(event, context):
             if action_id: logger.info(f"Received ACTION_ID: '{action_id}'")
             if text_input: logger.info(f"Received TEXT_INPUT: '{text_input}'")
 
-            # --- Authenticated User Flow ---
-            user_info = get_user_info(user_id_clean)
+            # --- Authenticated User Flow (tolerante ao 9º dígito) ---
+            user_info, user_id_clean = find_user(user_id_clean)
             if not user_info:
                 send_whapi_message(sender_id, MESSAGES['erro_usuario_nao_encontrado'])
                 continue
-            
+
+            # Só atendemos voluntários com cadastro aprovado pela Comissão.
+            if user_info.get('status') != 'approved':
+                send_whapi_message(sender_id, MESSAGES['cadastro_em_analise'])
+                continue
+
+            # Memoriza o JID real de onde a pessoa fala (para entregar no número certo).
+            if incoming_jid and user_info.get('wa_jid') != incoming_jid:
+                try:
+                    users_table.update_item(Key={'ID': user_id_clean},
+                        UpdateExpression='SET wa_jid = :w',
+                        ExpressionAttributeValues={':w': incoming_jid})
+                    user_info['wa_jid'] = incoming_jid
+                except Exception as e:
+                    logger.error(f"Error saving wa_jid for '{user_id_clean}': {e}")
+
             state = user_info.get('conversation_state', 'initial')
             logger.info(f"User: {user_id_clean}, State: {state}, Action_ID: {action_id}")
 

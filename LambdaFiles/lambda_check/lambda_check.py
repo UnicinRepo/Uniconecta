@@ -10,14 +10,28 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # --- Environment Variable Configurations ---
-DYNAMODB_USERS_TABLE_NAME = os.environ.get('AWS_DYNAMODB_TABLE_TARGET_NAME_0')
-DYNAMODB_REQUESTS_TABLE_NAME = os.environ.get('AWS_DYNAMODB_TABLE_TARGET_NAME_1')
+# Aceita as duas convenções de nome (com e sem TARGET) para casar com a infra.
+DYNAMODB_USERS_TABLE_NAME = os.environ.get('AWS_DYNAMODB_TABLE_NAME_0') or os.environ.get('AWS_DYNAMODB_TABLE_TARGET_NAME_0')
+DYNAMODB_REQUESTS_TABLE_NAME = os.environ.get('AWS_DYNAMODB_TABLE_NAME_1') or os.environ.get('AWS_DYNAMODB_TABLE_TARGET_NAME_1')
 AWS_REGION = os.environ.get('REGION', 'us-east-1')
 API_URL = os.environ.get('API_URL', 'https://gate.whapi.cloud')
-PARAM_NAME_TOKEN = os.getenv("AWS_SSM_PARAMETER_TARGET_NAME_0")
+PARAM_NAME_TOKEN = os.environ.get('AWS_SSM_PARAMETER_NAME_0') or os.getenv("AWS_SSM_PARAMETER_TARGET_NAME_0")
 
 # --- Hardcoded Supervisor List ---
-SUPERVISOR_NUMBERS = ['553186155781'] 
+SUPERVISOR_NUMBERS = ['553186155781']
+
+# --- Mensagens ---
+# Enviada ~10-15 min após o aceite (não junto do atendimento). Mantida idêntica ao
+# texto em chatbot_act.py (MESSAGES['feedback_prompt']).
+FEEDBACK_PROMPT = (
+    "A sua opinião é muito importante para nós! Estamos sempre em busca de evoluir a usabilidade e a experiência da Rede UniConecta CCCI.\n\n"
+    "Se quiser contribuir com sugestões, críticas construtivas ou melhorias, envie um e-mail para: uniconecta@unicin.org\n\n"
+    "A Rede de apoio UniConecta CCCI é construída por todos nós. \n"
+    "Contamos com você para torná-la cada vez mais funcional, acolhedora e interassistencial!"
+)
+
+# Atraso mínimo antes de enviar o feedback após o aceite.
+FEEDBACK_DELAY_MINUTES = 10
 
 # --- Validações e Clientes Boto3 ---
 if not all([DYNAMODB_USERS_TABLE_NAME, DYNAMODB_REQUESTS_TABLE_NAME, PARAM_NAME_TOKEN]):
@@ -131,6 +145,42 @@ def handle_stale_conversations(now, start_time_iso):
                 users_table.update_item(Key={'ID': user_id}, UpdateExpression='SET conversation_state = :state', ExpressionAttributeValues={':state': 'initial'})
 
 
+def handle_pending_feedback(now):
+    """(4) Enviar a mensagem de feedback ~10-15 min após o aceite (não junto do
+    atendimento). O bot marca feedback_pending=True e acceptance_timestamp ao aceitar."""
+    logger.info("Checking for pending feedback messages...")
+    cutoff = now - timedelta(minutes=FEEDBACK_DELAY_MINUTES)
+
+    response = requests_table.scan(
+        FilterExpression='#st = :status AND feedback_pending = :true',
+        ExpressionAttributeNames={'#st': 'status'},
+        ExpressionAttributeValues={':status': 'aceito', ':true': True}
+    )
+
+    for item in response.get('Items', []):
+        timestamp_str = item.get('acceptance_timestamp')
+        if not timestamp_str:
+            logger.warning(f"Skipping request {item.get('ID', 'N/A')} for feedback: missing 'acceptance_timestamp'.")
+            continue
+
+        accepted_at = datetime.fromisoformat(timestamp_str).replace(tzinfo=timezone.utc)
+        if accepted_at > cutoff:
+            continue  # aceite recente demais; envia numa próxima execução do monitor
+
+        target = item.get('requester_wa') or item.get('requester_id')
+        if not target:
+            logger.warning(f"Skipping request {item['ID']} for feedback: no requester target.")
+            continue
+
+        logger.info(f"Sending delayed feedback for request {item['ID']} to {target}.")
+        if send_whapi_message(f"{target}@s.whatsapp.net", FEEDBACK_PROMPT):
+            requests_table.update_item(
+                Key={'ID': item['ID']},
+                UpdateExpression='SET feedback_pending = :false',
+                ExpressionAttributeValues={':false': False}
+            )
+
+
 # --- Handler Principal da Lambda ---
 
 def lambda_handler(event, context):
@@ -148,7 +198,9 @@ def lambda_handler(event, context):
         # --- CHAMADA para handle_accepted_requests REMOVIDA ---
         
         handle_stale_conversations(now, two_hours_ago_iso)
-        
+
+        handle_pending_feedback(now)
+
         logger.info("Monitor run completed successfully.")
         return {'statusCode': 200, 'body': json.dumps('Monitor run completed.')}
         
